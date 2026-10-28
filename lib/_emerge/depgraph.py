@@ -650,6 +650,11 @@ class _dynamic_depgraph_config:
         # Caches visible packages returned from _select_package, for use in
         # depgraph._iter_atoms_for_pkg() SLOT logic.
         self._visible_pkgs = {}
+        # Caches the package that _select_pkg_from_installed() chooses for an
+        # atom. Removing packages resolves many atoms over and over again,
+        # and the installed packages do not change during that. The cache is
+        # scoped to this config, so backtracking starts with a fresh one.
+        self._installed_pkg_selection = {}
         # contains the args created by select_files
         self._initial_arg_list = []
         self.digraph = portage.digraph()
@@ -4598,14 +4603,39 @@ class depgraph:
                         ):
                             return 0
 
-                dep_string = portage.dep.use_reduce(
-                    dep_string,
-                    uselist=use_enabled,
-                    is_valid_flag=pkg.iuse.is_valid_flag,
-                    opconvert=True,
-                    token_class=Atom,
-                    eapi=pkg.eapi,
-                )
+                if pkg.installed:
+                    # Invalid USE conditionals are ignored for installed
+                    # packages anyway (see the fallback below), so skip the
+                    # IUSE validation for them, and ignore EAPI compatibility
+                    # the same way Package._validate_deps does. Without a
+                    # disjunction the result is a plain conjunction, so the C
+                    # parser can produce it as a flat list; opconvert is only
+                    # needed to preserve "||" groups.
+                    if "||" in dep_string:
+                        dep_string = portage.dep.use_reduce(
+                            dep_string,
+                            uselist=use_enabled,
+                            opconvert=True,
+                            token_class=Atom,
+                            eapi=None,
+                        )
+                    else:
+                        dep_string = portage.dep.use_reduce(
+                            dep_string,
+                            uselist=use_enabled,
+                            flat=True,
+                            token_class=Atom,
+                            eapi=None,
+                        )
+                else:
+                    dep_string = portage.dep.use_reduce(
+                        dep_string,
+                        uselist=use_enabled,
+                        is_valid_flag=pkg.iuse.is_valid_flag,
+                        opconvert=True,
+                        token_class=Atom,
+                        eapi=pkg.eapi,
+                    )
             except portage.exception.InvalidDependString as e:
                 if not pkg.installed:
                     # should have been masked before it was selected
@@ -8796,11 +8826,44 @@ class depgraph:
         """
         Select packages that are installed.
         """
+        cache_key = (root, atom, onlydeps)
+        cache = self._dynamic_config._installed_pkg_selection
+        if cache_key in cache:
+            pkg = cache[cache_key]
+            if pkg is None:
+                return None, None
+        else:
+            pkg = self._select_pkg_from_installed_uncached(
+                root, atom, onlydeps, cache_key
+            )
+            if pkg is None:
+                return None, None
+
+        in_graph = next(
+            self._dynamic_config._package_tracker.match(
+                root, pkg.slot_atom, installed=False
+            ),
+            None,
+        )
+
+        return pkg, in_graph
+
+    def _select_pkg_from_installed_uncached(self, root, atom, onlydeps, cache_key):
+        """
+        Select packages that are installed, caching the result when it cannot
+        change as the graph grows.
+        """
         matches = list(
             self._iter_match_pkgs(self._frozen_config.roots[root], "installed", atom)
         )
         if not matches:
-            return None, None
+            self._dynamic_config._installed_pkg_selection[cache_key] = None
+            return None
+        # A package that is in the graph is treated as visible even if it is
+        # masked (see _pkg_visibility_check), so the choice below can change
+        # after a masked package is added to the graph. Only cache a choice
+        # that visibility cannot affect.
+        cacheable = len(matches) == 1 or all(pkg.visible for pkg in matches)
         if len(matches) > 1:
             matches.reverse()  # ascending order
             unmasked = [pkg for pkg in matches if self._pkg_visibility_check(pkg)]
@@ -8827,14 +8890,10 @@ class depgraph:
                                 matches = unmasked
 
         pkg = matches[-1]  # highest match
-        in_graph = next(
-            self._dynamic_config._package_tracker.match(
-                root, pkg.slot_atom, installed=False
-            ),
-            None,
-        )
+        if cacheable:
+            self._dynamic_config._installed_pkg_selection[cache_key] = pkg
 
-        return pkg, in_graph
+        return pkg
 
     def _complete_graph(self, required_sets=None):
         """

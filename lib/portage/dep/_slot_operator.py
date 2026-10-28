@@ -24,10 +24,15 @@ def strip_slots(dep_struct):
 def find_built_slot_operator_atoms(pkg):
     atoms = {}
     for k in Package._dep_keys:
+        depstr = pkg._metadata[k]
+        # A built slot operator atom needs a slot and sub-slot (":slot/subslot="),
+        # so a string without ':', '/' and '=' cannot contain one.
+        if ":" not in depstr or "/" not in depstr or "=" not in depstr:
+            continue
         atom_list = list(
             _find_built_slot_operator(
                 use_reduce(
-                    pkg._metadata[k],
+                    depstr,
                     uselist=pkg.use.enabled,
                     eapi=pkg.eapi,
                     token_class=Atom,
